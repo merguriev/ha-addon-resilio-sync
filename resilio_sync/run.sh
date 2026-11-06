@@ -3,7 +3,7 @@
 # 1) Бэкапы HA (/backup, только чтение) раз в N минут копируются в /share/resilio/ha-backups;
 #    хранятся последние keep_backups.
 # 2) Resilio Sync синхронизирует эту папку. Два режима:
-#    * webui: true (по умолчанию) — веб-интерфейс Resilio на порту webui_port. Resilio 3.x без активированной
+#    * webui: true (по умолчанию) — веб-интерфейс Resilio на порту из раздела «Сеть» (8888/tcp). Resilio 3.x без активированной
 #      лицензии (бесплатной после регистрации или Pro) не синхронизирует — активация делается в интерфейсе,
 #      там же добавляется папка /share/resilio/ha-backups. Состояние Resilio хранится между запусками.
 #    * webui: false — папка задаётся конфигурацией с ключом из /data/secret (без интерфейса; лицензию так
@@ -17,7 +17,7 @@ INTERVAL=$(jq -r '.copy_interval_minutes' "$OPT")
 PORT=$(jq -r '.listening_port' "$OPT")
 HOSTS=$(jq -c '.known_hosts // []' "$OPT")
 WEBUI=$(jq -r 'if .webui == false then "false" else "true" end' "$OPT")
-WEBPORT=$(jq -r '.webui_port // 8888' "$OPT")
+WEBPORT_OPT=$(jq -r '.webui_port // empty' "$OPT")
 
 SYNC_DIR=/share/resilio/ha-backups
 TMP_DIR=/share/resilio/.tmp
@@ -60,6 +60,17 @@ RS_UPDATED=""
 if [ -z "${SUPERVISOR_TOKEN:-}" ] && [ -r /run/s6/container_environment/SUPERVISOR_TOKEN ]; then
     SUPERVISOR_TOKEN=$(cat /run/s6/container_environment/SUPERVISOR_TOKEN)
 fi
+
+# Порт веб-интерфейса — из раздела «Сеть» дополнения (8888/tcp): на него же ведёт кнопка «Открыть веб-интерфейс».
+# Устаревшая опция webui_port учитывается, только если Supervisor недоступен.
+WEBPORT=""
+if [ -n "${SUPERVISOR_TOKEN:-}" ]; then
+    WEBPORT=$(curl -fsS -m 10 -H "Authorization: Bearer ${SUPERVISOR_TOKEN}" http://supervisor/addons/self/info 2>/dev/null               | jq -r '.data.network["8888/tcp"] // empty' 2>/dev/null)
+fi
+if [ -n "$WEBPORT_OPT" ] && [ "$WEBPORT_OPT" != "${WEBPORT:-8888}" ]; then
+    log "Опция webui_port ($WEBPORT_OPT) устарела и не используется — порт меняется в разделе «Сеть» дополнения"
+fi
+WEBPORT=${WEBPORT:-${WEBPORT_OPT:-8888}}
 ha_post() {   # ha_post <путь API core> <json>
     [ -n "${SUPERVISOR_TOKEN:-}" ] || return 1
     curl -fsS -o /dev/null -X POST -H "Authorization: Bearer ${SUPERVISOR_TOKEN}" -H "Content-Type: application/json" \
@@ -187,7 +198,7 @@ apply_license() {
     if [ -z "$tok" ]; then log "Лицензия: веб-интерфейс не ответил (проверьте webui_user/webui_password)"; return 0; fi
     resp=$(curl -fsS -m 30 -u "$WUSER:$WPASS" -c /tmp/rs.cookie -b /tmp/rs.cookie -G "$api/" \
            --data-urlencode "token=$tok" --data-urlencode "action=applylicensefile" --data-urlencode "path=$lic" 2>&1)
-    if echo "$resp" | grep -q -i '"error"'; then
+    if [ "$(echo "$resp" | jq -r '(.value.error // .error // 0) | tostring' 2>/dev/null || echo fail)" != "0" ]; then
         log "Лицензия: Resilio отклонил файл $(basename "$lic"): $(echo "$resp" | head -c 300)"
     else
         echo "$sum" > /data/.sync/license_applied
