@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
 # Resilio Sync для Home Assistant.
-# 1) Бэкапы HA (/backup, только чтение) раз в N минут копируются в /share/resilio/ha-backups
-#    с понятными именами «ГГГГ-ММ-ДД_ЧЧММ_<имя>_<slug>.tar»; хранятся последние keep_backups.
-# 2) Resilio Sync синхронизирует эту папку. Ключ папки создаётся при первом запуске (/data/secret),
-#    ключ «только чтение» для других устройств печатается в журнал дополнения.
+# 1) Бэкапы HA (/backup, только чтение) раз в N минут копируются в /share/resilio/ha-backups;
+#    хранятся последние keep_backups.
+# 2) Resilio Sync синхронизирует эту папку. Два режима:
+#    * webui: true (по умолчанию) — веб-интерфейс Resilio на порту webui_port. Resilio 3.x без активированной
+#      лицензии (бесплатной после регистрации или Pro) не синхронизирует — активация делается в интерфейсе,
+#      там же добавляется папка /share/resilio/ha-backups. Состояние Resilio хранится между запусками.
+#    * webui: false — папка задаётся конфигурацией с ключом из /data/secret (без интерфейса; лицензию так
+#      активировать нельзя — для Resilio 3.x подходит, только если лицензия уже есть в хранилище).
 set -uo pipefail
 
 OPT=/data/options.json
@@ -12,16 +16,24 @@ KEEP=$(jq -r '.keep_backups' "$OPT")
 INTERVAL=$(jq -r '.copy_interval_minutes' "$OPT")
 PORT=$(jq -r '.listening_port' "$OPT")
 HOSTS=$(jq -c '.known_hosts // []' "$OPT")
+WEBUI=$(jq -r 'if .webui == false then "false" else "true" end' "$OPT")
+WEBPORT=$(jq -r '.webui_port // 8888' "$OPT")
 
 SYNC_DIR=/share/resilio/ha-backups
 TMP_DIR=/share/resilio/.tmp
-# Служебное состояние Resilio (/data/.sync) сбрасываем при каждом запуске: иначе папка грузится из прошлого
-# sync.dat («Selected folder is already added»), а настройки из sync.conf (known_hosts и т.п.) не применяются.
-# Ключ (/data/secret) и файлы не трогаются, переиндексация нескольких файлов — секунды.
-rm -rf /data/.sync
-mkdir -p /data/.sync "$SYNC_DIR" "$TMP_DIR"
-
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
+
+# Смена режима: служебное состояние Resilio и метка папки (.sync/ID) от прежнего ключа мешают — сбрасываем.
+MODE="webui=$WEBUI"
+if [ "$(cat /data/mode 2>/dev/null)" != "$MODE" ]; then
+    log "Режим: $MODE — сбрасываю состояние Resilio от прежнего режима"
+    rm -rf /data/.sync "$SYNC_DIR/.sync"
+    echo "$MODE" > /data/mode
+fi
+# В режиме конфигурации состояние сбрасываем при каждом запуске: иначе папка грузится из прошлого sync.dat
+# («Selected folder is already added»), а настройки (known_hosts и т.п.) не применяются.
+[ "$WEBUI" = "false" ] && rm -rf /data/.sync
+mkdir -p /data/.sync "$SYNC_DIR" "$TMP_DIR"
 
 # --- обновление Resilio -------------------------------------------------------
 # Resilio в образе — версии на момент сборки. При каждом запуске проверяем официальный apt-репозиторий
@@ -38,66 +50,83 @@ else
     NEW_VER=$OLD_VER; log "Проверить обновление Resilio не удалось, работаю на $OLD_VER"
 fi
 rm -rf /var/lib/apt/lists/* 2>/dev/null
-mkdir -p /share/resilio
 PREV_VER=$(cat /share/resilio/.version 2>/dev/null || echo "")
 echo "$NEW_VER" > /share/resilio/.version
 RS_UPDATED=""
 [ -n "$PREV_VER" ] && [ "$PREV_VER" != "$NEW_VER" ] && RS_UPDATED="$PREV_VER"
 
-# --- ключ папки -------------------------------------------------------------
-if [ ! -s /data/secret ]; then
-    rslsync --generate-secret > /data/secret
-    log "Создан новый ключ папки"
-fi
-SECRET=$(tr -d '[:space:]' < /data/secret)
-RO_SECRET=$(rslsync --get-ro-secret "$SECRET" | tr -d '[:space:]')
-
-# --- конфигурация Resilio ----------------------------------------------------
-jq -n --arg name "$NAME" --argjson port "$PORT" --arg secret "$SECRET" --arg dir "$SYNC_DIR" --argjson hosts "$HOSTS" '{
-  device_name: $name,
-  listening_port: $port,
-  storage_path: "/data/.sync",
-  pid_file: "/data/rslsync.pid",
-  use_upnp: false,
-  shared_folders: [{
-    secret: $secret, dir: $dir,
-    use_relay_server: true, use_tracker: true, search_lan: true,
-    use_sync_trash: true, overwrite_changes: false,
-    known_hosts: $hosts
-  }]
-}' > /data/sync.conf
-
-log "=================================================================="
-log "Папка синхронизации: $SYNC_DIR (бэкапов хранится: $KEEP)"
-log "Ключ ТОЛЬКО ДЛЯ ЧТЕНИЯ — добавьте его в Resilio на ПК / сервере:"
-log "    $RO_SECRET"
-log "(Resilio → «+» → «Ввести ключ или ссылку»)"
-log "=================================================================="
-
-# тот же ключ — уведомлением в HA (видят только администраторы), чтобы не искать в журнале
+# --- токен Supervisor (уведомления и события в HA) ---------------------------
 # в образах HA с s6-overlay переменные окружения контейнера лежат в /run/s6/container_environment
 if [ -z "${SUPERVISOR_TOKEN:-}" ] && [ -r /run/s6/container_environment/SUPERVISOR_TOKEN ]; then
     SUPERVISOR_TOKEN=$(cat /run/s6/container_environment/SUPERVISOR_TOKEN)
 fi
-if [ -z "${SUPERVISOR_TOKEN:-}" ]; then
-    log "Нет SUPERVISOR_TOKEN — уведомление в HA не создано (ключ — выше в журнале)"
-else
-    jq -n --arg k "$RO_SECRET" --arg d "$SYNC_DIR" '{notification_id: "resilio_sync_key", title: "Resilio Sync: ключ для чтения",
-      message: ("Добавьте папку с бэкапами HA в Resilio на ПК или сервере: «+» → «Ввести ключ или ссылку».\n\nКлюч только для чтения:\n`" + $k + "`\n\nПапка в HA: " + $d)}' \
-    | curl -fsS -o /dev/null -X POST -H "Authorization: Bearer ${SUPERVISOR_TOKEN}" -H "Content-Type: application/json" \
-        --data-binary @- http://supervisor/core/api/services/persistent_notification/create \
-    || log "Не удалось создать уведомление в HA (ключ — выше в журнале)"
-    # Resilio обновился — событие resilio_sync_updated {old, new} для автоматизаций HA (например, Telegram)
-    if [ -n "$RS_UPDATED" ]; then
-        jq -n --arg o "$RS_UPDATED" --arg n "$NEW_VER" '{old: $o, new: $n}' \
-        | curl -fsS -o /dev/null -X POST -H "Authorization: Bearer ${SUPERVISOR_TOKEN}" -H "Content-Type: application/json" \
-            --data-binary @- http://supervisor/core/api/events/resilio_sync_updated \
-        || log "Не удалось отправить событие resilio_sync_updated"
-    fi
+ha_post() {   # ha_post <путь API core> <json>
+    [ -n "${SUPERVISOR_TOKEN:-}" ] || return 1
+    curl -fsS -o /dev/null -X POST -H "Authorization: Bearer ${SUPERVISOR_TOKEN}" -H "Content-Type: application/json" \
+        --data-binary "$2" "http://supervisor/core/api/$1"
+}
+notify() {    # notify <заголовок> <текст>
+    ha_post services/persistent_notification/create \
+        "$(jq -n --arg t "$1" --arg m "$(printf '%b' "$2")" '{notification_id: "resilio_sync_key", title: $t, message: $m}')" \
+    || log "Не удалось создать уведомление в HA"
+}
+if [ -n "$RS_UPDATED" ]; then
+    ha_post events/resilio_sync_updated "$(jq -n --arg o "$RS_UPDATED" --arg n "$NEW_VER" '{old: $o, new: $n}')" \
+    || log "Не удалось отправить событие resilio_sync_updated"
 fi
 
-# подробный отладочный журнал Resilio выключаем (по умолчанию маска FFFFFFFF засоряет журнал дополнения)
-if [ "$(jq -r '.debug // false' "$OPT")" = "true" ]; then echo FFFFFFFF > /data/.sync/debug.txt; log "Подробный журнал Resilio включён (debug)"; else echo 0 > /data/.sync/debug.txt; fi
+# --- конфигурация Resilio ----------------------------------------------------
+if [ "$WEBUI" = "true" ]; then
+    jq -n --arg name "$NAME" --argjson port "$PORT" --arg web "0.0.0.0:$WEBPORT" '{
+      device_name: $name, listening_port: $port,
+      storage_path: "/data/.sync", pid_file: "/data/rslsync.pid", use_upnp: false,
+      directory_root: "/share/resilio/",
+      webui: { listen: $web }
+    }' > /data/sync.conf
+    HOST_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -n 1)
+    URL="http://${HOST_IP:-<IP Home Assistant>}:$WEBPORT/gui/"
+    log "=================================================================="
+    log "Веб-интерфейс Resilio: $URL"
+    log "1) задайте логин и пароль; 2) активируйте лицензию (Resilio 3.x без неё не синхронизирует):"
+    log "   бесплатная — регистрация на resilio.com/sync/register, или ваша Pro — «Связать устройство»;"
+    log "3) «+» → «Стандартная папка» → $SYNC_DIR, затем «Поделиться» → ключ «Только чтение» для ПК."
+    log "Бэкапы копируются в эту папку автоматически (хранится: $KEEP)."
+    log "=================================================================="
+    notify "Resilio Sync: настройте в веб-интерфейсе" \
+        "Откройте [$URL]($URL)\n\n1. Задайте логин и пароль.\n2. Активируйте лицензию — Resilio 3.x без неё не синхронизирует: бесплатная после регистрации на resilio.com/sync/register или ваша Pro («Связать устройство»).\n3. «+» → «Стандартная папка» → \`$SYNC_DIR\`, затем «Поделиться» → ключ «Только чтение» — его добавьте в Resilio на ПК.\n\nБэкапы HA копируются в эту папку автоматически."
+else
+    if [ ! -s /data/secret ]; then
+        rslsync --generate-secret > /data/secret
+        log "Создан новый ключ папки"
+    fi
+    SECRET=$(tr -d '[:space:]' < /data/secret)
+    RO_SECRET=$(rslsync --get-ro-secret "$SECRET" | tr -d '[:space:]')
+    jq -n --arg name "$NAME" --argjson port "$PORT" --arg secret "$SECRET" --arg dir "$SYNC_DIR" --argjson hosts "$HOSTS" '{
+      device_name: $name, listening_port: $port,
+      storage_path: "/data/.sync", pid_file: "/data/rslsync.pid", use_upnp: false,
+      shared_folders: [{
+        secret: $secret, dir: $dir,
+        use_relay_server: true, use_tracker: true, search_lan: true,
+        use_sync_trash: true, overwrite_changes: false,
+        known_hosts: $hosts
+      }]
+    }' > /data/sync.conf
+    log "=================================================================="
+    log "Папка синхронизации: $SYNC_DIR (бэкапов хранится: $KEEP)"
+    log "Ключ ТОЛЬКО ДЛЯ ЧТЕНИЯ — добавьте его в Resilio на ПК / сервере:"
+    log "    $RO_SECRET"
+    log "(Resilio → «+» → «Ввести ключ или ссылку»)"
+    log "=================================================================="
+    notify "Resilio Sync: ключ для чтения" \
+        "Добавьте папку с бэкапами HA в Resilio на ПК или сервере: «+» → «Ввести ключ или ссылку».\n\nКлюч только для чтения:\n\`$RO_SECRET\`\n\nПапка в HA: $SYNC_DIR"
+fi
+
+# подробный журнал Resilio — только по опции debug (по умолчанию маска FFFFFFFF засоряет журнал дополнения)
+if [ "$(jq -r '.debug // false' "$OPT")" = "true" ]; then
+    echo FFFFFFFF > /data/.sync/debug.txt; log "Подробный журнал Resilio включён (debug)"
+else
+    echo 0 > /data/.sync/debug.txt
+fi
 
 # --- копирование бэкапов ----------------------------------------------------
 backup_name() {
@@ -115,14 +144,13 @@ backup_name() {
 
 copy_loop() {
     while true; do
-        copied=0
         # только последние KEEP бэкапов HA — иначе старые копировались бы и тут же удалялись
         while IFS= read -r src; do
             dst=$(backup_name "$src")
             [ -e "$SYNC_DIR/$dst" ] && continue
             # cp -p: дата файла = дата бэкапа, по ней ниже определяются самые старые
             if cp -p "$src" "$TMP_DIR/$dst" && mv "$TMP_DIR/$dst" "$SYNC_DIR/$dst"; then
-                copied=$((copied + 1)); log "Скопирован бэкап: $dst"
+                log "Скопирован бэкап: $dst"
             else
                 rm -f "$TMP_DIR/$dst"; log "Ошибка копирования: $src"
             fi

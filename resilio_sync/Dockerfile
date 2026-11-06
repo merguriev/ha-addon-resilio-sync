@@ -5,7 +5,7 @@ FROM ${BUILD_FROM}
 # В репозиторий дополнения бинарник не входит. CDN с архивами (download-cdn.resilio.com) из некоторых
 # регионов отвечает 404, а apt-репозиторий доступен.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl gnupg jq tar \
+    && apt-get install -y --no-install-recommends ca-certificates curl gnupg iproute2 jq tar \
     && curl -fsSL https://linux-packages.resilio.com/resilio-sync/key.asc \
        | gpg --dearmor -o /usr/share/keyrings/resilio-sync.gpg \
     && echo "deb [signed-by=/usr/share/keyrings/resilio-sync.gpg] https://linux-packages.resilio.com/resilio-sync/deb resilio-sync non-free" \
