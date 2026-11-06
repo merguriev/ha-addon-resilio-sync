@@ -1,5 +1,5 @@
 name: Resilio Sync
-version: "1.0.3"
+version: "1.1.1"
 slug: resilio_sync
 description: Синхронизирует бэкапы Home Assistant на ваши устройства через Resilio Sync
 url: https://github.com/merguriev/ha-addon-resilio-sync

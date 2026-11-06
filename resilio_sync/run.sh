@@ -18,6 +18,27 @@ mkdir -p /data/.sync "$SYNC_DIR" "$TMP_DIR"
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
 
+# --- обновление Resilio -------------------------------------------------------
+# Resilio в образе — версии на момент сборки. При каждом запуске проверяем официальный apt-репозиторий
+# (с подписью Resilio) и ставим новую версию. Нет сети — работаем на текущей. Перезапуск дополнения раз в
+# неделю (автоматизация в HA) = автообновление. Версия пишется в /share/resilio/.version (для HA).
+rs_version() { dpkg-query -W -f='${Version}' resilio-sync 2>/dev/null || echo "?"; }
+OLD_VER=$(rs_version)
+if timeout 180 apt-get update -o Dir::Etc::sourcelist=sources.list.d/resilio-sync.list \
+        -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0 -qq > /dev/null 2>&1 \
+   && timeout 300 apt-get install -y -qq --only-upgrade --no-install-recommends resilio-sync > /dev/null 2>&1; then
+    NEW_VER=$(rs_version)
+    [ "$NEW_VER" != "$OLD_VER" ] && log "Resilio Sync обновлён: $OLD_VER → $NEW_VER" || log "Resilio Sync $NEW_VER (последняя)"
+else
+    NEW_VER=$OLD_VER; log "Проверить обновление Resilio не удалось, работаю на $OLD_VER"
+fi
+rm -rf /var/lib/apt/lists/* 2>/dev/null
+mkdir -p /share/resilio
+PREV_VER=$(cat /share/resilio/.version 2>/dev/null || echo "")
+echo "$NEW_VER" > /share/resilio/.version
+RS_UPDATED=""
+[ -n "$PREV_VER" ] && [ "$PREV_VER" != "$NEW_VER" ] && RS_UPDATED="$PREV_VER"
+
 # --- ключ папки -------------------------------------------------------------
 if [ ! -s /data/secret ]; then
     rslsync --generate-secret > /data/secret
@@ -60,6 +81,13 @@ else
     | curl -fsS -o /dev/null -X POST -H "Authorization: Bearer ${SUPERVISOR_TOKEN}" -H "Content-Type: application/json" \
         --data-binary @- http://supervisor/core/api/services/persistent_notification/create \
     || log "Не удалось создать уведомление в HA (ключ — выше в журнале)"
+    # Resilio обновился — событие resilio_sync_updated {old, new} для автоматизаций HA (например, Telegram)
+    if [ -n "$RS_UPDATED" ]; then
+        jq -n --arg o "$RS_UPDATED" --arg n "$NEW_VER" '{old: $o, new: $n}' \
+        | curl -fsS -o /dev/null -X POST -H "Authorization: Bearer ${SUPERVISOR_TOKEN}" -H "Content-Type: application/json" \
+            --data-binary @- http://supervisor/core/api/events/resilio_sync_updated \
+        || log "Не удалось отправить событие resilio_sync_updated"
+    fi
 fi
 
 # подробный отладочный журнал Resilio выключаем (по умолчанию маска FFFFFFFF засоряет журнал дополнения)
