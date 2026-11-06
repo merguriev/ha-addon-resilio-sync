@@ -1,0 +1,28 @@
+name: Resilio Sync
+version: "1.0.3"
+slug: resilio_sync
+description: Синхронизирует бэкапы Home Assistant на ваши устройства через Resilio Sync
+url: https://github.com/merguriev/ha-addon-resilio-sync
+arch:
+  - aarch64
+  - amd64
+startup: application
+boot: auto
+init: false
+# Resilio находит другие устройства в локальной сети широковещанием — нужна сеть хоста
+host_network: true
+# уведомление с ключом в HA
+homeassistant_api: true
+map:
+  - backup:ro
+  - share:rw
+options:
+  device_name: Home Assistant
+  keep_backups: 7
+  copy_interval_minutes: 15
+  listening_port: 55555
+schema:
+  device_name: str
+  keep_backups: int(1,100)
+  copy_interval_minutes: int(1,1440)
+  listening_port: port
