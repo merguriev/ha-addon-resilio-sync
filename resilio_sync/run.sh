@@ -77,11 +77,12 @@ fi
 
 # --- конфигурация Resilio ----------------------------------------------------
 if [ "$WEBUI" = "true" ]; then
-    jq -n --arg name "$NAME" --argjson port "$PORT" --arg web "0.0.0.0:$WEBPORT" '{
+    WUSER=$(jq -r '.webui_user // ""' "$OPT"); WPASS=$(jq -r '.webui_password // ""' "$OPT")
+    jq -n --arg name "$NAME" --argjson port "$PORT" --arg web "0.0.0.0:$WEBPORT" --arg u "$WUSER" --arg p "$WPASS" '{
       device_name: $name, listening_port: $port,
       storage_path: "/data/.sync", pid_file: "/data/rslsync.pid", use_upnp: false,
       directory_root: "/share/resilio/",
-      webui: { listen: $web }
+      webui: ({ listen: $web } + (if $u != "" and $p != "" then {login: $u, password: $p} else {} end))
     }' > /data/sync.conf
     HOST_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -n 1)
     URL="http://${HOST_IP:-<IP Home Assistant>}:$WEBPORT/gui/"
@@ -163,6 +164,45 @@ copy_loop() {
     done
 }
 
+# --- автоприменение лицензии ---------------------------------------------------
+# Файл лицензии (*.btskey) в /share/resilio/ применяется через API веб-интерфейса (action=applylicensefile,
+# path — путь на этом устройстве). Нужны логин/пароль интерфейса из опций. Повторно — только если файл сменился
+# или сброшено состояние Resilio (метка лежит в /data/.sync).
+apply_license() {
+    local lic sum api tok resp i
+    lic=$(ls -1t /share/resilio/*.btskey 2>/dev/null | head -n 1)
+    [ -n "$lic" ] || return 0
+    if [ -z "${WUSER:-}" ] || [ -z "${WPASS:-}" ]; then
+        log "Есть файл лицензии $(basename "$lic"), но не заданы webui_user/webui_password — применить автоматически нельзя"
+        return 0
+    fi
+    sum=$(sha256sum "$lic" | cut -c1-16)
+    [ "$(cat /data/.sync/license_applied 2>/dev/null)" = "$sum" ] && return 0
+    api="http://127.0.0.1:$WEBPORT/gui"
+    for i in $(seq 1 30); do   # ждём, пока поднимется веб-интерфейс
+        tok=$(curl -fsS -m 5 -u "$WUSER:$WPASS" -c /tmp/rs.cookie -b /tmp/rs.cookie "$api/token.html" 2>/dev/null \
+              | sed -n "s/.*<div id='token'[^>]*>\([^<]*\)<.*/\1/p")
+        [ -n "$tok" ] && break; sleep 2
+    done
+    if [ -z "$tok" ]; then log "Лицензия: веб-интерфейс не ответил (проверьте webui_user/webui_password)"; return 0; fi
+    resp=$(curl -fsS -m 30 -u "$WUSER:$WPASS" -c /tmp/rs.cookie -b /tmp/rs.cookie -G "$api/" \
+           --data-urlencode "token=$tok" --data-urlencode "action=applylicensefile" --data-urlencode "path=$lic" 2>&1)
+    if echo "$resp" | grep -q -i '"error"'; then
+        log "Лицензия: Resilio отклонил файл $(basename "$lic"): $(echo "$resp" | head -c 300)"
+    else
+        echo "$sum" > /data/.sync/license_applied
+        log "Лицензия применена из $(basename "$lic")"
+        info=$(curl -fsS -m 15 -u "$WUSER:$WPASS" -c /tmp/rs.cookie -b /tmp/rs.cookie -G "$api/" \
+               --data-urlencode "token=$tok" --data-urlencode "action=getlicenseinfo" 2>/dev/null | head -c 300)
+        [ -n "$info" ] && log "Лицензия: $info"
+    fi
+    rm -f /tmp/rs.cookie
+}
+
 copy_loop &
 log "Запуск Resilio Sync"
-exec rslsync --nodaemon --config /data/sync.conf
+rslsync --nodaemon --config /data/sync.conf &
+RS_PID=$!
+trap 'kill -TERM "$RS_PID" 2>/dev/null' TERM INT
+[ "$WEBUI" = "true" ] && apply_license
+wait "$RS_PID"

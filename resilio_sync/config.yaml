@@ -1,5 +1,5 @@
 name: Resilio Sync
-version: "1.3.0"
+version: "1.4.0"
 slug: resilio_sync
 description: Синхронизирует бэкапы Home Assistant на ваши устройства через Resilio Sync
 url: https://github.com/merguriev/ha-addon-resilio-sync
@@ -31,6 +31,8 @@ options:
   debug: false
   webui: true
   webui_port: 8888
+  webui_user: ""
+  webui_password: ""
 schema:
   device_name: str
   keep_backups: int(1,100)
@@ -42,3 +44,5 @@ schema:
   debug: bool
   webui: bool
   webui_port: port
+  webui_user: str?
+  webui_password: password?
