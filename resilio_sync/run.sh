@@ -93,7 +93,7 @@ else
 fi
 
 # подробный отладочный журнал Resilio выключаем (по умолчанию маска FFFFFFFF засоряет журнал дополнения)
-echo 0 > /data/.sync/debug.txt
+if [ "$(jq -r '.debug // false' "$OPT")" = "true" ]; then echo FFFFFFFF > /data/.sync/debug.txt; log "Подробный журнал Resilio включён (debug)"; else echo 0 > /data/.sync/debug.txt; fi
 
 # --- копирование бэкапов ----------------------------------------------------
 backup_name() {
