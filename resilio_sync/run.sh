@@ -11,6 +11,7 @@ NAME=$(jq -r '.device_name' "$OPT")
 KEEP=$(jq -r '.keep_backups' "$OPT")
 INTERVAL=$(jq -r '.copy_interval_minutes' "$OPT")
 PORT=$(jq -r '.listening_port' "$OPT")
+HOSTS=$(jq -c '.known_hosts // []' "$OPT")
 
 SYNC_DIR=/share/resilio/ha-backups
 TMP_DIR=/share/resilio/.tmp
@@ -48,7 +49,7 @@ SECRET=$(tr -d '[:space:]' < /data/secret)
 RO_SECRET=$(rslsync --get-ro-secret "$SECRET" | tr -d '[:space:]')
 
 # --- конфигурация Resilio ----------------------------------------------------
-jq -n --arg name "$NAME" --argjson port "$PORT" --arg secret "$SECRET" --arg dir "$SYNC_DIR" '{
+jq -n --arg name "$NAME" --argjson port "$PORT" --arg secret "$SECRET" --arg dir "$SYNC_DIR" --argjson hosts "$HOSTS" '{
   device_name: $name,
   listening_port: $port,
   storage_path: "/data/.sync",
@@ -57,7 +58,8 @@ jq -n --arg name "$NAME" --argjson port "$PORT" --arg secret "$SECRET" --arg dir
   shared_folders: [{
     secret: $secret, dir: $dir,
     use_relay_server: true, use_tracker: true, search_lan: true,
-    use_sync_trash: true, overwrite_changes: false
+    use_sync_trash: true, overwrite_changes: false,
+    known_hosts: $hosts
   }]
 }' > /data/sync.conf
 
