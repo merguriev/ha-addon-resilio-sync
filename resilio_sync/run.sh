@@ -15,6 +15,10 @@ HOSTS=$(jq -c '.known_hosts // []' "$OPT")
 
 SYNC_DIR=/share/resilio/ha-backups
 TMP_DIR=/share/resilio/.tmp
+# Служебное состояние Resilio (/data/.sync) сбрасываем при каждом запуске: иначе папка грузится из прошлого
+# sync.dat («Selected folder is already added»), а настройки из sync.conf (known_hosts и т.п.) не применяются.
+# Ключ (/data/secret) и файлы не трогаются, переиндексация нескольких файлов — секунды.
+rm -rf /data/.sync
 mkdir -p /data/.sync "$SYNC_DIR" "$TMP_DIR"
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
